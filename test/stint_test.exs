@@ -32,6 +32,22 @@ defmodule StintTest do
     assert Stint.count(owner, @item) == 2
   end
 
+  test "a below-minimum tick is dropped instead of opening a stint", %{owner: owner} do
+    {:ok, nil, :skipped} = Stint.track(owner, @item, 3, at: at("2026-07-14T20:00:03Z"), min: 10)
+    assert Stint.count(owner, @item) == 0
+
+    # at or above the minimum opens normally
+    {:ok, _s, :started} = Stint.track(owner, @item, 10, at: at("2026-07-14T20:10:10Z"), min: 10)
+    assert Stint.count(owner, @item) == 1
+  end
+
+  test "a below-minimum tick still extends a running stint", %{owner: owner} do
+    {:ok, s1, :started} = Stint.track(owner, @item, 30, at: at("2026-07-14T20:00:30Z"), min: 10)
+    {:ok, s2, :extended} = Stint.track(owner, @item, 3, at: at("2026-07-14T20:01:00Z"), min: 10)
+    assert s2.id == s1.id
+    assert s2.seconds == 33
+  end
+
   test "gap is tunable per call", %{owner: owner} do
     {:ok, s1, :started} = Stint.track(owner, @item, 10, at: at("2026-07-14T20:00:10Z"))
     # 3 minutes later, but with a 60s gap → new stint

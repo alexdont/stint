@@ -34,7 +34,10 @@ end
 
 ```elixir
 # config/config.exs
-config :stint, repo: MyApp.Repo
+config :stint,
+  repo: MyApp.Repo,
+  default_gap: 300,   # optional: app-wide gap window (s)
+  default_min: 0      # optional: app-wide minimum to open a stint (s)
 ```
 
 ```elixir
@@ -56,6 +59,10 @@ end
 {:ok, stint, :extended | :started} =
   Stint.track(owner, item, seconds,
     gap: 300,                      # silence that splits stints (s)
+    min: 10,                       # min seconds to OPEN a stint — smaller
+                                   # ticks extend fine but never start one
+                                   # (drops blink-and-close opens; such a
+                                   # tick returns {:ok, nil, :skipped})
     at: DateTime.utc_now(),        # tick timestamp
     meta: %{"chapter" => "153"}    # shallow-merged, last write wins
   )

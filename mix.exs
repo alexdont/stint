@@ -1,7 +1,7 @@
 defmodule Stint.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.1.1"
   @description "Tick-based activity session tracking — no start/stop calls, just report elapsed time and stints (bounded periods of activity) assemble themselves via gap-stitching. Second-resolution start/end per stint, session counts, day/timezone queries. Bring your own Ecto repo."
   @source_url "https://github.com/alexdont/stint"
 

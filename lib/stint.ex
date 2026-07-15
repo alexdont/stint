@@ -40,6 +40,12 @@ defmodule Stint do
 
     * `:gap` — seconds of silence that split stints (default `300`,
       configurable app-wide via `config :stint, default_gap: n`)
+    * `:min` — minimum seconds required to *open a new* stint; a
+      smaller tick is dropped unless it extends one already running
+      (default `0`, configurable app-wide via
+      `config :stint, default_min: n`). Filters accidental
+      blink-and-close opens without shaving the tail off real
+      sessions.
     * `:at` — the tick's timestamp (default `DateTime.utc_now/0`)
     * `:meta` — map shallow-merged into the stint's `meta` on every
       tick (last write wins per key)
@@ -53,6 +59,7 @@ defmodule Stint do
   alias Stint.Record
 
   @default_gap 300
+  @default_min 0
 
   @type owner :: String.t()
   @type item :: String.t()
@@ -64,12 +71,15 @@ defmodule Stint do
 
   Extends the latest stint when its end is within the gap window of
   `:at`; opens a new stint otherwise (with `started_at` back-dated by
-  `seconds`, so the first tick doesn't lose its own duration).
+  `seconds`, so the first tick doesn't lose its own duration). When
+  there is nothing to extend and `seconds` is below `:min`, the tick
+  is dropped instead of opening a stint.
 
-  Returns `{:ok, stint, :extended | :started}`.
+  Returns `{:ok, stint, :extended | :started}`, or `{:ok, nil, :skipped}`
+  for a dropped below-minimum tick.
   """
   @spec track(owner, item, non_neg_integer, keyword) ::
-          {:ok, Record.t(), :extended | :started} | {:error, term}
+          {:ok, Record.t(), :extended | :started} | {:ok, nil, :skipped} | {:error, term}
   def track(owner, item, seconds, opts \\ [])
       when is_binary(owner) and is_binary(item) and is_integer(seconds) do
     seconds = max(seconds, 0)
@@ -77,6 +87,7 @@ defmodule Stint do
     # utc_datetime_usec and caller-supplied :at values often aren't.
     now = DateTime.add(Keyword.get(opts, :at) || DateTime.utc_now(), 0, :microsecond)
     gap = Keyword.get(opts, :gap) || Application.get_env(:stint, :default_gap, @default_gap)
+    min = Keyword.get(opts, :min) || Application.get_env(:stint, :default_min, @default_min)
     meta = Keyword.get(opts, :meta, %{})
 
     repo().transaction(fn ->
@@ -104,6 +115,11 @@ defmodule Stint do
           )
           |> repo().update!()
           |> then(&{&1, :extended})
+
+        nil when seconds < min ->
+          # Nothing running and too little activity to justify a new
+          # stint — an accidental open-and-close, not a session.
+          {nil, :skipped}
 
         nil ->
           %Record{
