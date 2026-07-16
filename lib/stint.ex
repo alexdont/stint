@@ -40,12 +40,14 @@ defmodule Stint do
 
     * `:gap` — seconds of silence that split stints (default `300`,
       configurable app-wide via `config :stint, default_gap: n`)
-    * `:min` — minimum seconds required to *open a new* stint; a
-      smaller tick is dropped unless it extends one already running
-      (default `0`, configurable app-wide via
-      `config :stint, default_min: n`). Filters accidental
-      blink-and-close opens without shaving the tail off real
-      sessions.
+    * `:min` — stints whose accumulated seconds stay below this are
+      hidden from the query functions and garbage-collected once a
+      newer stint opens on the same item (default `0`, configurable
+      app-wide via `config :stint, default_min: n`). Recording is
+      never blocked: a blink-and-close open still writes its stint —
+      ticks are often tiny and must accumulate, and a quick return
+      within the gap extends the ghost into a real session — it just
+      isn't *remembered* if it never grows past the minimum.
     * `:at` — the tick's timestamp (default `DateTime.utc_now/0`)
     * `:meta` — map shallow-merged into the stint's `meta` on every
       tick (last write wins per key)
@@ -71,15 +73,14 @@ defmodule Stint do
 
   Extends the latest stint when its end is within the gap window of
   `:at`; opens a new stint otherwise (with `started_at` back-dated by
-  `seconds`, so the first tick doesn't lose its own duration). When
-  there is nothing to extend and `seconds` is below `:min`, the tick
-  is dropped instead of opening a stint.
+  `seconds`, so the first tick doesn't lose its own duration).
+  Opening a new stint garbage-collects the item's earlier stints that
+  never accumulated `:min` seconds — see the `:min` option.
 
-  Returns `{:ok, stint, :extended | :started}`, or `{:ok, nil, :skipped}`
-  for a dropped below-minimum tick.
+  Returns `{:ok, stint, :extended | :started}`.
   """
   @spec track(owner, item, non_neg_integer, keyword) ::
-          {:ok, Record.t(), :extended | :started} | {:ok, nil, :skipped} | {:error, term}
+          {:ok, Record.t(), :extended | :started} | {:error, term}
   def track(owner, item, seconds, opts \\ [])
       when is_binary(owner) and is_binary(item) and is_integer(seconds) do
     seconds = max(seconds, 0)
@@ -116,12 +117,18 @@ defmodule Stint do
           |> repo().update!()
           |> then(&{&1, :extended})
 
-        nil when seconds < min ->
-          # Nothing running and too little activity to justify a new
-          # stint — an accidental open-and-close, not a session.
-          {nil, :skipped}
-
         nil ->
+          # A new stint is opening, so any earlier stint on this item
+          # is closed for good (it's outside the gap window) — sweep
+          # the ones that never grew past :min. They were
+          # blink-and-close ghosts, not sessions.
+          if min > 0 do
+            Record
+            |> where([s], s.owner_id == ^owner and s.item == ^item)
+            |> where([s], s.seconds < ^min and s.ended_at < ^threshold)
+            |> repo().delete_all()
+          end
+
           %Record{
             owner_id: owner,
             item: item,
@@ -147,7 +154,8 @@ defmodule Stint do
   crossing midnight appears on both dates it touches — clamp for
   display with `clamp_to_date/3` if needed.
 
-  Options: `:utc_offset` (seconds, default 0), `:item` to filter.
+  Options: `:utc_offset` (seconds, default 0), `:item` to filter,
+  `:min` to override the below-minimum filter.
   """
   @spec on_date(owner, Date.t(), keyword) :: [Record.t()]
   def on_date(owner, %Date{} = date, opts \\ []) do
@@ -157,6 +165,7 @@ defmodule Stint do
     |> where([s], s.owner_id == ^owner)
     |> where([s], s.ended_at > ^day_start and s.started_at < ^day_end)
     |> maybe_filter_item(Keyword.get(opts, :item))
+    |> filter_min(opts)
     |> order_by([s], asc: s.started_at)
     |> repo().all()
   end
@@ -164,18 +173,20 @@ defmodule Stint do
   @doc """
   Number of stints by `owner` on `item` — "read in 14 stints".
   """
-  @spec count(owner, item) :: non_neg_integer
-  def count(owner, item) do
+  @spec count(owner, item, keyword) :: non_neg_integer
+  def count(owner, item, opts \\ []) do
     Record
     |> where([s], s.owner_id == ^owner and s.item == ^item)
+    |> filter_min(opts)
     |> repo().aggregate(:count)
   end
 
   @doc "Stint counts per item for an owner: `%{item => count}`."
-  @spec counts(owner) :: %{item => non_neg_integer}
-  def counts(owner) do
+  @spec counts(owner, keyword) :: %{item => non_neg_integer}
+  def counts(owner, opts \\ []) do
     Record
     |> where([s], s.owner_id == ^owner)
+    |> filter_min(opts)
     |> group_by([s], s.item)
     |> select([s], {s.item, count(s.id)})
     |> repo().all()
@@ -183,21 +194,23 @@ defmodule Stint do
   end
 
   @doc "Total tracked seconds for an owner, optionally per item."
-  @spec total_seconds(owner, item | nil) :: non_neg_integer
-  def total_seconds(owner, item \\ nil) do
+  @spec total_seconds(owner, item | nil, keyword) :: non_neg_integer
+  def total_seconds(owner, item \\ nil, opts \\ []) do
     Record
     |> where([s], s.owner_id == ^owner)
     |> maybe_filter_item(item)
+    |> filter_min(opts)
     |> repo().aggregate(:sum, :seconds)
     |> Kernel.||(0)
   end
 
   @doc "The owner's most recent stint, optionally per item."
-  @spec last(owner, item | nil) :: Record.t() | nil
-  def last(owner, item \\ nil) do
+  @spec last(owner, item | nil, keyword) :: Record.t() | nil
+  def last(owner, item \\ nil, opts \\ []) do
     Record
     |> where([s], s.owner_id == ^owner)
     |> maybe_filter_item(item)
+    |> filter_min(opts)
     |> order_by([s], desc: s.ended_at)
     |> limit(1)
     |> repo().one()
@@ -224,6 +237,16 @@ defmodule Stint do
 
   defp maybe_filter_item(query, nil), do: query
   defp maybe_filter_item(query, item), do: where(query, [s], s.item == ^item)
+
+  # Hide stints that haven't accumulated :min seconds (yet) — they're
+  # either blink-and-close ghosts awaiting GC or brand-new sessions
+  # that will cross the bar within a tick or two.
+  defp filter_min(query, opts) do
+    case Keyword.get(opts, :min) || Application.get_env(:stint, :default_min, @default_min) do
+      0 -> query
+      min -> where(query, [s], s.seconds >= ^min)
+    end
+  end
 
   defp local_day_bounds(date, utc_offset) do
     day_start =

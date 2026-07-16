@@ -32,20 +32,31 @@ defmodule StintTest do
     assert Stint.count(owner, @item) == 2
   end
 
-  test "a below-minimum tick is dropped instead of opening a stint", %{owner: owner} do
-    {:ok, nil, :skipped} = Stint.track(owner, @item, 3, at: at("2026-07-14T20:00:03Z"), min: 10)
-    assert Stint.count(owner, @item) == 0
+  test "sub-minimum stints record and accumulate, but hide from queries until they cross :min", %{owner: owner} do
+    # tick streams are tiny — recording must never be blocked
+    {:ok, s1, :started} = Stint.track(owner, @item, 3, at: at("2026-07-14T20:00:03Z"), min: 10)
+    assert Stint.count(owner, @item, min: 10) == 0
+    assert Stint.on_date(owner, ~D[2026-07-14], min: 10) == []
+    assert Stint.last(owner, @item, min: 10) == nil
 
-    # at or above the minimum opens normally
-    {:ok, _s, :started} = Stint.track(owner, @item, 10, at: at("2026-07-14T20:10:10Z"), min: 10)
-    assert Stint.count(owner, @item) == 1
+    # next tiny tick extends the ghost; crossing :min makes it visible
+    {:ok, s2, :extended} = Stint.track(owner, @item, 4, at: at("2026-07-14T20:00:40Z"), min: 10)
+    assert s2.id == s1.id
+    {:ok, s3, :extended} = Stint.track(owner, @item, 5, at: at("2026-07-14T20:01:20Z"), min: 10)
+    assert s3.seconds == 12
+    assert Stint.count(owner, @item, min: 10) == 1
+    assert [%{seconds: 12}] = Stint.on_date(owner, ~D[2026-07-14], min: 10)
   end
 
-  test "a below-minimum tick still extends a running stint", %{owner: owner} do
-    {:ok, s1, :started} = Stint.track(owner, @item, 30, at: at("2026-07-14T20:00:30Z"), min: 10)
-    {:ok, s2, :extended} = Stint.track(owner, @item, 3, at: at("2026-07-14T20:01:00Z"), min: 10)
-    assert s2.id == s1.id
-    assert s2.seconds == 33
+  test "opening a new stint garbage-collects the item's sub-minimum ghosts", %{owner: owner} do
+    # a blink-and-close open that never grew
+    {:ok, ghost, :started} = Stint.track(owner, @item, 3, at: at("2026-07-14T20:00:03Z"), min: 10)
+
+    # a real session later — the ghost is outside the gap and swept
+    {:ok, real, :started} = Stint.track(owner, @item, 30, at: at("2026-07-14T21:00:30Z"), min: 10)
+    refute real.id == ghost.id
+    assert Stint.count(owner, @item, min: 0) == 1
+    assert [%{seconds: 30}] = Stint.on_date(owner, ~D[2026-07-14], min: 0)
   end
 
   test "gap is tunable per call", %{owner: owner} do
